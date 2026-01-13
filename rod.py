@@ -63,6 +63,8 @@ bd2_tip_onode: Any = None
 force_marker: Optional[ProxyScenePart] = None
 force_phase: str = "NONE"  # "D" | "E" | "NONE"
 
+PHASE_F_FX_CONST: float = 15.0  # N
+PHASE_G_FY_CONST: float = 15.0  # N
 
 def _scalar(x: Any) -> float:
     return float(np.asarray(x).reshape(-1)[0])
@@ -262,15 +264,16 @@ class HardClampHinge(PyKModelBase):
 class TipForceXYToHingeTorque(PyKModelBase):
     """
     Build limitation workaround:
-    - user thinks they're applying Fx/Fy at the tip (in bd2 frame)
+    - Instead of applying Fx/Fy at the tip (in bd2 frame)
     - we convert to pin torque about +Z
 
     For r = [L, 0, 0] and F = [Fx, Fy, 0]:
       tau_z = (r x F)_z = L * Fy
     """
-    def __init__(self, name: str, sp: Any, pin: PinSubhinge, lever_len: float) -> None:
+    def __init__(self, name: str, sp: Any, pin1: PinSubhinge, pin2: PinSubhinge, lever_len: float) -> None:
         super().__init__(name, sp)
-        self._pin: PinSubhinge = pin
+        self._pin1: PinSubhinge = pin1
+        self._pin2: PinSubhinge = pin2
         self._L: float = float(lever_len)
         self.enabled: bool = False
         self.force_xy: np.ndarray = np.zeros(2, dtype=float)  # [Fx, Fy]
@@ -278,15 +281,23 @@ class TipForceXYToHingeTorque(PyKModelBase):
     def preDeriv(self, t: Any, x: Any) -> None:
         if not self.enabled:
             return
+        q1: float = _scalar(self._pin1.getQ())
+        q2: float = _scalar(self._pin2.getQ())
+        theta: float = q1 + q2
+
+        fx: float = float(self.force_xy[0])
         fy: float = float(self.force_xy[1])
-        tau_z: float = self._L * fy
-        self._pin.setT(tau_z)
+
+        rx: float = self._L * float(np.cos(theta))
+        ry: float = self._L * float(np.sin(theta))
+
+        tau_z: float = (rx * fy) - (ry * fx)
+        self._pin2.setT(tau_z) 
 
 
 class ForceDriver(PyKModelBase):
     """
     Drives tip_force_xy.force_xy during Phase D/E.
-    Also updates the visual force marker position.
     """
     def __init__(self, name: str, sp: Any, force_model: TipForceXYToHingeTorque) -> None:
         super().__init__(name, sp)
@@ -303,12 +314,21 @@ class ForceDriver(PyKModelBase):
             force_marker.setTranslation([0.0, 0.0, 0.0])
             return
 
-        ux: float = fx / mag
-        uy: float = fy / mag
+        ux_w: float = fx / mag
+        uy_w: float = fy / mag
+        q1: float = _scalar(bd1_pin.getQ())
+        q2: float = _scalar(bd2_pin.getQ())
+        theta: float = q1 + q2
+
+        # Convert WORLD direction -> LOCAL tip-node direction by rotating -theta
+        c: float = float(np.cos(-theta))
+        s: float = float(np.sin(-theta))
+        ux_l: float = c * ux_w - s * uy_w
+        uy_l: float = s * ux_w + c * uy_w
 
         dist: float = min(FORCE_VIS_MAX, FORCE_VIS_SCALE * mag)
-        force_marker.setTranslation([dist * ux, dist * uy, 0.0])
-
+        force_marker.setTranslation([dist * ux_l, dist * uy_l, 0.0])
+    
     def preDeriv(self, t: Any, x: Any) -> None:
         global force_phase
         if not self._force_model.enabled:
@@ -320,8 +340,8 @@ class ForceDriver(PyKModelBase):
 
         dt_s: float = (t_ns - self._t0_ns) / 1e9
 
-        fx: float = 0.0
-        fy: float = 0.0
+        fx: float = float(self._force_model.force_xy[0])
+        fy: float = float(self._force_model.force_xy[1])
 
         if force_phase == "D":
             theta: float = 2.0 * pi * PHASE_D_SWEEP_HZ * dt_s
@@ -356,13 +376,16 @@ proxy_scene = mb.getScene()
 # Visuals
 rod_geom: BoxGeometry = BoxGeometry(ROD_LEN, 0.05, 0.05)
 bead_geom: BoxGeometry = BoxGeometry(0.08, 0.08, 0.08)
-force_marker_geom: BoxGeometry = BoxGeometry(0.05, 0.05, 0.05)
+force_marker_geom: BoxGeometry = BoxGeometry(0.035, 0.035, 0.035)
 
 mat_info: PhysicalMaterialInfo = PhysicalMaterialInfo()
 mat_info.color = Color.FIREBRICK
 brown: PhysicalMaterial = PhysicalMaterial(mat_info)
 mat_info.color = Color.GOLD
 gold: PhysicalMaterial = PhysicalMaterial(mat_info)
+mat_info2: PhysicalMaterialInfo = PhysicalMaterialInfo()
+mat_info2.color = Color.LIME
+lime: PhysicalMaterial = PhysicalMaterial(mat_info2)
 
 scene_parts: list[Any] = []
 
@@ -386,13 +409,7 @@ if bd2_tip_onode is not None:
     bead1: ProxyScenePart = ProxyScenePart("bead_tip_onode_visual", scene=proxy_scene, geometry=bead_geom, material=gold)
     bead1.attachTo(bd2_tip_onode)
     bead1.setTranslation([0.0, 0.0, 0.0])
-    scene_parts.append(bead1)
-
-    force_marker = ProxyScenePart("force_marker", scene=proxy_scene, geometry=force_marker_geom, material=gold)
-    force_marker.attachTo(bd2_tip_onode)
-    force_marker.setTranslation([0.0, 0.0, 0.0])
-    scene_parts.append(force_marker)
-
+ 
 # Propagator
 sp: StatePropagator = StatePropagator(
     mb,
@@ -414,7 +431,7 @@ sp.registerModel(hinge_limits)
 freeze_model: FreezeHingesModel = FreezeHingesModel("freeze_hinges", sp, bd1_pin, bd2_pin)
 sp.registerModel(freeze_model)
 
-tip_force_xy: TipForceXYToHingeTorque = TipForceXYToHingeTorque("tip_force_xy", sp, bd2_pin, ROD_LEN)
+tip_force_xy: TipForceXYToHingeTorque = TipForceXYToHingeTorque("tip_force_xy", sp,bd1_pin, bd2_pin, ROD_LEN)
 sp.registerModel(tip_force_xy)
 
 force_driver: ForceDriver = ForceDriver("force_driver", sp, tip_force_xy)
@@ -495,10 +512,11 @@ def run_phase(
         fx: float = float(tip_force_xy.force_xy[0])
         fy: float = float(tip_force_xy.force_xy[1])
         print(
-            f"t={t_s:7.2f}  hinge2_q={q2:+.3f}  hinge2_u={u2:+.3f}  "
-            f"mode0_q={mode0_q:+.6f}  mode0_u={mode0_u:+.6f}  "
-            f"Fxy=[{fx:+.1f},{fy:+.1f}]"
-        )
+  f"t={t_s:7.2f} mode={FORCE_COMPONENT_MODE:<6} phase={force_phase:<4} "
+  f"hinge2_q={q2:+.3f} hinge2_u={u2:+.3f} "
+  f"mode0_q={mode0_q:+.6f} mode0_u={mode0_u:+.6f} "
+  f"Fxy=[{fx:+.1f},{fy:+.1f}]"
+)
 
     h_ns: int = int(print_every_s * 1e9)
     now_ns: int = int(integrator.getTime())
@@ -520,7 +538,7 @@ sp.setState(sp.assembleState())
 
 print("\n--- BUILD NOTE ---")
 print("This build does NOT consume Node/body external wrenches from Python.")
-print("We fake tip forces via hinge torque, and visualize the Fx/Fy vector.")
+print("We fake tip forces via hinge torque")
 print(f"Hinge2 is limited to [{HINGE2_Q_MIN:+.2f}, {HINGE2_Q_MAX:+.2f}] with soft stops + hard clamp.\n")
 
 set_hinges(0.0, 0.0, 0.0, 0.0)
@@ -532,12 +550,13 @@ bd2_pin.setQ(pi / 3.0)
 push_state()
 input("Pose check 2: link2 rotates about end of link1. Press Enter...")
 
-set_hinges(0.2, 0.0, 0.0, 0.0)
+set_hinges(0.2, 0.0, 0.5, 0.0)
 push_state()
 input("Pose check 3: both rods point +X in their own frames. Press Enter...")
 
-pluck_mode0(q_amp=0.3, u_amp=0.0)
-enable_modal_damping(0.02)
+pluck_mode0(q_amp=0.2, u_amp=0.2)
+enable_modal_damping(0.50)
+set_hinges(0, 0, 0, 0)
 push_state()
 input("Modal check: bead should wiggle + visibly offset in +Y (visual bend hack). Press Enter...")
 
@@ -551,9 +570,9 @@ def phase_a() -> None:
     force_phase = "NONE"
     gravity_model.params.g = np.array([0.0, -9.81, 0.0], dtype=float)
 
-    set_hinges(q1=0.4, u1=0.0, q2=0.0, u2=0.0)
+    set_hinges(q1=0.0, u1=0.0, q2=0.0, u2=0.0)
     zero_modes()
-    enable_modal_damping(0.02)
+    enable_modal_damping(0.0)
 
     tip_force_xy.enabled = False
     tip_force_xy.force_xy[:] = 0.0
@@ -569,7 +588,7 @@ def phase_b() -> None:
 
     # modal-only, exaggerate
     enable_modal_damping(0.01)
-    pluck_mode0(q_amp=0.8, u_amp=0.0)
+    pluck_mode0(q_amp=0.2, u_amp=0.0)
 
     tip_force_xy.enabled = False
     tip_force_xy.force_xy[:] = 0.0
@@ -582,11 +601,11 @@ def phase_c() -> None:
     gravity_model.params.g = np.array([0.0, -9.81, 0.0], dtype=float)
 
     set_hinges(q1=0.2, u1=0.0, q2=0.0, u2=0.0)
-    enable_modal_damping(0.02)
-    pluck_mode0(q_amp=0.05, u_amp=0.8)
+    enable_modal_damping(0.5)
+    pluck_mode0(q_amp=0.05, u_amp=0.05)
 
     tip_force_xy.enabled = True
-    tip_force_xy.force_xy[:] = [0.0, 50.0]
+    tip_force_xy.force_xy[:] = [0.0, 10.0]
 
 
 def phase_d() -> None:
@@ -615,6 +634,38 @@ def phase_e() -> None:
 
     tip_force_xy.enabled = True
     tip_force_xy.force_xy[:] = 0.0
+def phase_f_fx_only_constant() -> None:
+    global freeze_hinges_enabled, force_phase, FORCE_COMPONENT_MODE
+    freeze_hinges_enabled = False
+    force_phase = "NONE"
+    FORCE_COMPONENT_MODE = "X_ONLY"
+    gravity_model.params.g = np.array([0.0, 0.0, 0.0], dtype=float)
+
+    # IMPORTANT: make Fx create torque by rotating the rod away from +X
+    set_hinges(q1=pi / 2.0, u1=0.0, q2=0.0, u2=0.0)
+
+    zero_modes()
+    enable_modal_damping(0.02)
+
+    tip_force_xy.enabled = True
+    tip_force_xy.force_xy[:] = [PHASE_F_FX_CONST, 0.0]
+
+
+def phase_g_fy_only_constant() -> None:
+    global freeze_hinges_enabled, force_phase, FORCE_COMPONENT_MODE
+    freeze_hinges_enabled = False
+    force_phase = "NONE"
+    FORCE_COMPONENT_MODE = "Y_ONLY"
+    gravity_model.params.g = np.array([0.0, 0.0, 0.0], dtype=float)
+
+    # For Fy, rod can be horizontal (theta ~= 0) and you get tau_z ~= L*Fy
+    set_hinges(q1=0.0, u1=0.0, q2=0.0, u2=0.0)
+
+    zero_modes()
+    enable_modal_damping(0.02)
+
+    tip_force_xy.enabled = True
+    tip_force_xy.force_xy[:] = [0.0, PHASE_G_FY_CONST]
 
 
 input("\nREADY CHECK: press Enter to start the simulation phases...")
@@ -624,6 +675,8 @@ run_phase("B_modal_only_frozen_hinges (exaggerated)", duration_s=10.0, pre_step=
 run_phase("C_coupled", duration_s=15.0, pre_step=phase_c)
 run_phase("D_force_sweep_XY (slow)", duration_s=15.0, pre_step=phase_d)
 run_phase("E_force_circle_XY (slow)", duration_s=15.0, pre_step=phase_e)
+run_phase("F_constant_Fx_only (world)", duration_s=8.0, pre_step=phase_f_fx_only_constant)
+run_phase("G_constant_Fy_only (world)", duration_s=8.0, pre_step=phase_g_fy_only_constant)
 
 input("Done. Press Enter to quit...")
 sp.dump("sp")
